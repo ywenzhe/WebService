@@ -61,7 +61,6 @@ namespace far_memory {
         constexpr static double kZipfParamS = 0.85;
         constexpr static uint32_t kNumKeysPerRequest = 32;
         constexpr static uint32_t kNumReqs = kNumKVPairs / kNumKeysPerRequest;
-        constexpr static uint32_t kTotalTargetRequests = 2e7; // 2千万次请求
         constexpr static uint32_t kLog10NumKeysPerRequest =
             helpers::static_log(10, kNumKeysPerRequest);
         constexpr static uint32_t kReqLen = kKeyLen - kLog10NumKeysPerRequest;
@@ -70,7 +69,7 @@ namespace far_memory {
         // Output.
         constexpr static uint32_t kPrintPerIters = 8192;
         constexpr static uint32_t kMaxPrintIntervalUs = 1000 * 1000; // 1 second(s).
-        // constexpr static uint32_t kPrintTimes = 100;
+        constexpr static uint32_t kPrintTimes = 100;
 
         struct Req {
             char data[kReqLen];
@@ -255,12 +254,7 @@ namespace far_memory {
                     array_miss_rate_records.push_back(array_miss_rate);
                     us = microtime();
                     running_us += (us - prev_us);
-
-                    double progress = (double)sum_reqs / kTotalTargetRequests;
-                    std::cout << "[Progress] Completed " << sum_reqs << " / " << kTotalTargetRequests
-                        << " requests (" << progress * 100 << " %)." << std::endl;
-
-                    if (sum_reqs >= kTotalTargetRequests) {
+                    if (print_times++ >= kPrintTimes) {
                         constexpr double kRatioChosenRecords = 0.1;
                         uint32_t num_chosen_records =
                             mops_records.size() * kRatioChosenRecords;
