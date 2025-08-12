@@ -2,8 +2,8 @@
 
 source ../../shared.sh
 
-arr_aifm_heap_size=( 256 512 7168 13824 20480 )
-arr_hashtable_idx_shift=( 27 28 28 28 28 )
+arr_aifm_heap_size=( 11605 13824 16043 18261 20480 )
+arr_hashtable_idx_shift=( 28 28 28 28 28 )
 
 sudo pkill -9 main
 

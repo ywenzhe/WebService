@@ -19,13 +19,12 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
-#include <atomic> // Used for std::atomic
+#include <atomic>
 #include <chrono>
-#include <iostream>
-#include <iomanip>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -61,9 +60,8 @@ namespace far_memory {
         constexpr static uint32_t kNumMutatorThreads = 40;
         constexpr static double kZipfParamS = 0.85;
         constexpr static uint32_t kNumKeysPerRequest = 32;
-        constexpr static uint32_t kNumReqs = (1 << 27) / kNumKeysPerRequest;
-        constexpr static uint32_t kNumBenchmarkLoops = 3;
-        constexpr static uint32_t kTotalTargetRequests = kNumReqs * kNumBenchmarkLoops;
+        constexpr static uint32_t kNumReqs = kNumKVPairs / kNumKeysPerRequest;
+        constexpr static uint32_t kTotalTargetRequests = 2e7; // 2千万次请求
         constexpr static uint32_t kLog10NumKeysPerRequest =
             helpers::static_log(10, kNumKeysPerRequest);
         constexpr static uint32_t kReqLen = kKeyLen - kLog10NumKeysPerRequest;
@@ -72,6 +70,7 @@ namespace far_memory {
         // Output.
         constexpr static uint32_t kPrintPerIters = 8192;
         constexpr static uint32_t kMaxPrintIntervalUs = 1000 * 1000; // 1 second(s).
+        // constexpr static uint32_t kPrintTimes = 100;
 
         struct Req {
             char data[kReqLen];
@@ -105,9 +104,17 @@ namespace far_memory {
         Cnt local_hashtable_miss_cnts[kNumMutatorThreads];
         Cnt per_core_req_idx[helpers::kNumCPUs];
 
-        std::atomic<uint64_t> total_completed_reqs{0}; // Global atomic counter for completed requests
-        std::atomic_flag print_lock_flag = ATOMIC_FLAG_INIT; // For protected print_progress
-        uint64_t last_print_us = 0; // Last time progress was actually printed
+        std::atomic_flag flag;
+        uint64_t print_times = 0;
+        uint64_t prev_sum_reqs = 0;
+        uint64_t prev_sum_array_misses = 0;
+        uint64_t prev_sum_hashtable_misses = 0;
+        uint64_t prev_us = 0;
+        uint64_t running_us = 0;
+        std::vector<double> mops_records;
+        std::vector<double> hashtable_miss_rate_records;
+        std::vector<double> array_miss_rate_records;
+        std::atomic<bool> should_stop{ false };
 
         unsigned char key[CryptoPP::AES::DEFAULT_KEYLENGTH];
         unsigned char iv[CryptoPP::AES::BLOCKSIZE];
@@ -115,17 +122,12 @@ namespace far_memory {
         std::unique_ptr<CryptoPP::AES::Encryption> aesEncryption;
 
 
-        inline void append_uint32_to_char_array(uint32_t n, uint32_t suffix_len,
-            char* array) {
+        inline void append_uint32_to_char_array(uint32_t n, uint32_t suffix_len, char* array) {
             uint32_t len = 0;
-            if (n == 0) { // Handle case n=0
-                array[len++] = '0';
-            } else {
-                while (n) {
-                    auto digit = n % 10;
-                    array[len++] = digit + '0';
-                    n = n / 10;
-                }
+            while (n) {
+                auto digit = n % 10;
+                array[len++] = digit + '0';
+                n = n / 10;
             }
             while (len < suffix_len) {
                 array[len++] = '0';
@@ -173,12 +175,9 @@ namespace far_memory {
             std::vector<rt::Thread> threads;
             for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
                 threads.emplace_back(rt::Thread([&, tid]() {
-                    // Each thread prepares a portion of kNumReqs
                     auto num_reqs_per_thread = kNumReqs / kNumMutatorThreads;
                     auto req_offset = tid * num_reqs_per_thread;
                     auto* thread_gen_reqs = &all_gen_reqs[req_offset];
-                    
-                    // Loop through kNumReqs to generate and put unique KVs
                     for (uint32_t i = 0; i < num_reqs_per_thread; i++) {
                         Req req;
                         random_req(req.data, tid);
@@ -190,8 +189,7 @@ namespace far_memory {
                             Value value;
                             value.num = (j ? 0 : req_offset + i);
                             DerefScope scope;
-                            hopscotch->put(scope, kKeyLen, (const uint8_t*)key.data, kValueLen,
-                                (uint8_t*)value.data);
+                            hopscotch->put(scope, kKeyLen, (const uint8_t*)key.data, kValueLen, (uint8_t*)value.data);
                         }
                         thread_gen_reqs[i] = req;
                     }
@@ -231,44 +229,89 @@ namespace far_memory {
             ACCESS_ONCE(compressed_len);
         }
 
-        void print_progress_status() {
-            // Only one thread should enter this section to print
-            if (!print_lock_flag.test_and_set()) {
+        void print_perf() {
+            if (!flag.test_and_set()) {
                 preempt_disable();
                 auto us = microtime();
-                // Throttle prints by time interval
-                if (us - last_print_us > kMaxPrintIntervalUs) {
-                    uint64_t current_completed = total_completed_reqs.load(std::memory_order_relaxed);
-                    double progress_percent = (double)current_completed * 100.0 / kTotalTargetRequests;
-                    
-                    std::cout << "[Progress] Completed " << current_completed << " / " << kTotalTargetRequests 
-                              << " requests (" << std::fixed << std::setprecision(2) << progress_percent << " %)." << std::endl;
-                    last_print_us = us;
+                uint64_t sum_reqs = 0;
+                uint64_t sum_hashtable_misses = 0;
+                uint64_t sum_array_misses = 0;
+                for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
+                    sum_reqs += ACCESS_ONCE(req_cnts[i].c);
+                    sum_hashtable_misses += ACCESS_ONCE(local_hashtable_miss_cnts[i].c);
+                    sum_array_misses += ACCESS_ONCE(local_array_miss_cnts[i].c);
+                }
+                if (us - prev_us > kMaxPrintIntervalUs) {
+                    auto mops =
+                        ((double)(sum_reqs - prev_sum_reqs) / (us - prev_us)) * 1.098;
+                    auto hashtable_miss_rate =
+                        (double)(sum_hashtable_misses - prev_sum_hashtable_misses) /
+                        (kNumKeysPerRequest * (sum_reqs - prev_sum_reqs));
+                    auto array_miss_rate =
+                        (double)(sum_array_misses - prev_sum_array_misses) /
+                        (sum_reqs - prev_sum_reqs);
+                    mops_records.push_back(mops);
+                    hashtable_miss_rate_records.push_back(hashtable_miss_rate);
+                    array_miss_rate_records.push_back(array_miss_rate);
+                    us = microtime();
+                    running_us += (us - prev_us);
+
+                    double progress = (double)sum_reqs / kTotalTargetRequests;
+                    std::cout << "[Progress] Completed " << sum_reqs << " / " << kTotalTargetRequests
+                        << " requests (" << progress * 100 << " %)." << std::endl;
+
+                    if (sum_reqs >= kTotalTargetRequests) {
+                        constexpr double kRatioChosenRecords = 0.1;
+                        uint32_t num_chosen_records =
+                            mops_records.size() * kRatioChosenRecords;
+                        mops_records.erase(mops_records.begin(),
+                            mops_records.end() - num_chosen_records);
+                        hashtable_miss_rate_records.erase(hashtable_miss_rate_records.begin(),
+                            hashtable_miss_rate_records.end() -
+                            num_chosen_records);
+                        array_miss_rate_records.erase(array_miss_rate_records.begin(),
+                            array_miss_rate_records.end() -
+                            num_chosen_records);
+                        std::cout << "running time = "
+                            << running_us / 1e6 << " seconds"
+                            << std::endl;
+
+                        std::cout << "mops = "
+                            << accumulate(mops_records.begin(), mops_records.end(), 0.0) / mops_records.size()
+                            << std::endl;
+
+                        std::cout << "hashtable miss rate = "
+                            << accumulate(hashtable_miss_rate_records.begin(), hashtable_miss_rate_records.end(), 0.0) / hashtable_miss_rate_records.size()
+                            << std::endl;
+
+                        std::cout << "array miss rate = "
+                            << accumulate(array_miss_rate_records.begin(), array_miss_rate_records.end(), 0.0) / array_miss_rate_records.size()
+                            << std::endl;
+
+                        should_stop.store(true, std::memory_order_relaxed);
+                    }
+                    prev_us = us;
+                    prev_sum_reqs = sum_reqs;
+                    prev_sum_array_misses = sum_array_misses;
+                    prev_sum_hashtable_misses = sum_hashtable_misses;
                 }
                 preempt_enable();
-                print_lock_flag.clear();
+                flag.clear();
             }
         }
 
         void bench(GenericConcurrentHopscotch* hopscotch, AppArray* array) {
             std::vector<rt::Thread> threads;
-            
-            // --- START TIMER ---
-            uint64_t start_us = microtime();
-            last_print_us = start_us; // Initialize for progress printing
-
+            prev_us = microtime();
             for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
                 threads.emplace_back(rt::Thread([&, tid]() {
                     uint32_t cnt = 0;
-                    // --- Loop until total_completed_reqs reaches kTotalTargetRequests ---
-                    while (total_completed_reqs.load(std::memory_order_relaxed) < kTotalTargetRequests) {
-                        // Check for progress printing periodically
+                    while (!should_stop.load(std::memory_order_relaxed)) {
                         if (unlikely(cnt++ % kPrintPerIters == 0)) {
                             preempt_disable();
-                            print_progress_status(); // Call new progress function
+                            print_perf();
                             preempt_enable();
                         }
-                        
                         preempt_disable();
                         auto core_num = get_core_num();
                         auto req_idx =
@@ -311,34 +354,12 @@ namespace far_memory {
                         core_num = get_core_num();
                         preempt_enable();
                         ACCESS_ONCE(req_cnts[tid].c)++;
-                        // --- Increment the global completed requests counter ---
-                        total_completed_reqs.fetch_add(1, std::memory_order_relaxed);
                     }
                     }));
             }
             for (auto& thread : threads) {
                 thread.Join();
             }
-            
-            // --- END TIMER AND CALCULATE RUNTIME ---
-            uint64_t end_us = microtime();
-            double runtime_seconds = (double)(end_us - start_us) / 1e6;
-            
-            std::cout << "\n---------------------------------------------------" << std::endl;
-            std::cout << "Benchmark Finished!" << std::endl;
-            std::cout << "Total Requests Processed: " << kTotalTargetRequests << std::endl;
-            std::cout << "Total Runtime: " << std::fixed << std::setprecision(4) << runtime_seconds << " seconds" << std::endl;
-            
-            // Print total miss counts if desired
-            uint64_t total_ht_misses = 0;
-            uint64_t total_array_misses = 0;
-            for(uint32_t tid = 0; tid < kNumMutatorThreads; ++tid) {
-                total_ht_misses += local_hashtable_miss_cnts[tid].c;
-                total_array_misses += local_array_miss_cnts[tid].c;
-            }
-            std::cout << "Total Hashtable Misses: " << total_ht_misses << std::endl;
-            std::cout << "Total Array Misses: " << total_array_misses << std::endl;
-            std::cout << "---------------------------------------------------\n" << std::endl;
         }
 
         public:
@@ -353,20 +374,17 @@ namespace far_memory {
                 manager->allocate_array_heap<ArrayEntry, kNumArrayEntries>());
             array_ptr->disable_prefetch();
             prepare(array_ptr.get());
-            std::cout << "Benchmarking " << kTotalTargetRequests << " requests..." << std::endl;
+            std::cout << "Bench..." << std::endl;
             bench(hopscotch.get(), array_ptr.get());
-            hopscotch.reset();
-            array_ptr.reset();
         }
 
         void run(netaddr raddr) {
-            BUG_ON(madvise(all_gen_reqs, sizeof(Req) * kNumReqs, MADV_HUGEPAGE) != 0); // Adjust size here
+            BUG_ON(madvise(all_gen_reqs, sizeof(Req) * kNumReqs, MADV_HUGEPAGE) != 0);
             std::unique_ptr<FarMemManager> manager =
                 std::unique_ptr<FarMemManager>(FarMemManagerFactory::build(
                     kCacheSize, kNumGCThreads,
                     new TCPDevice(raddr, kNumConnections, kFarMemSize)));
             do_work(manager.get());
-            manager.reset();
         }
     };
 } // namespace far_memory
@@ -403,4 +421,3 @@ int main(int _argc, char* argv[]) {
 
     return 0;
 }
-
