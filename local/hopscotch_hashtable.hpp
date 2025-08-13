@@ -12,7 +12,7 @@
 
 namespace far_memory {
 
-// 模拟原代码的复杂哈希表实现
+// 模拟原代码的哈希表实现
 class HopscotchHashTable {
 private:
     struct BucketEntry {

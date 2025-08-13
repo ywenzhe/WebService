@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <vector>
+#include <sched.h>
 
 // crypto++
 #include <cryptopp/aes.h>
@@ -86,7 +87,7 @@ private:
     std::vector<ArrayEntry> array_entries;
     std::unique_ptr<HopscotchHashTable> hashtable;
 
-    Cnt req_cnts[kNumMutatorThreads];
+    Cnt req_cnts[kNumMutatorThreads] = {}; // 初始化为0
     std::atomic_flag flag;
     uint64_t print_times = 0;
     uint64_t prev_sum_reqs = 0;
@@ -115,7 +116,8 @@ private:
     }
 
     inline void random_string(char* data, uint32_t len) {
-        auto& generator = *generators[0];  // 简化版本使用单个生成器
+        uint32_t core_num = sched_getcpu();  // 获取当前CPU核心号
+        auto& generator = *generators[core_num];
         std::uniform_int_distribution<int> distribution('a', 'z' + 1);
         for (uint32_t i = 0; i < len; i++) {
             data[i] = char(distribution(generator));
@@ -186,7 +188,8 @@ private:
         }
 
         zipf_table_distribution<> zipf(kNumReqs, kZipfParamS);
-        auto& generator = *generators[0];
+        uint32_t core_num = sched_getcpu();  // 获取当前CPU核心号
+        auto& generator = *generators[core_num];
         constexpr uint32_t kPerCoreWinInterval = kReqSeqLen / kNumCPUs;
         for (uint32_t i = 0; i < kReqSeqLen; i++) {
             auto rand_idx = zipf(generator);
@@ -277,7 +280,7 @@ private:
         for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
             threads.emplace_back([&, tid]() {
                 uint32_t cnt = 0;
-                uint32_t core_num = tid % kNumCPUs;  // 简化的核心分配
+                uint32_t core_num = sched_getcpu();  // 获取实际的CPU核心号
 
                 while (!should_stop.load(std::memory_order_relaxed)) {
                     if (cnt++ % kPrintPerIters == 0) {
