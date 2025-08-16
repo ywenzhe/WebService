@@ -152,7 +152,7 @@ private:
 
         // 初始化请求数据
         all_gen_reqs.resize(kNumReqs);
-        hashtable = std::make_unique<HopscotchHashTable>(28);  // 2^28 = 256M entries
+        hashtable = std::make_unique<HopscotchHashTable>(27);  // 2^27 = 128M entries
 
         // 生成初始数据
         std::vector<std::thread> threads;
